@@ -12,16 +12,8 @@ M.default_config = {
 	enabled = false,
 	-- Show staged changes alongside unstaged ones, in separate colors.
 	show_staged = false,
-	colors = {
-		InlineDiffAddContext = "#182400",
-		InlineDiffAddChange = "#395200",
-		InlineDiffDeleteContext = "#240004",
-		InlineDiffDeleteChange = "#520005",
-		InlineDiffStagedAddContext = "#0b2233",
-		InlineDiffStagedAddChange = "#1f4f7a",
-		InlineDiffStagedDeleteContext = "#2b1d00",
-		InlineDiffStagedDeleteChange = "#6b4a00",
-	},
+	-- Colors are derived from the active colorscheme unless overridden here.
+	colors = {},
 	ignored_buftype = { "terminal", "nofile" },
 	ignored_filetype = { "TelescopePrompt", "NvimTree", "dap-repl", "neo-tree" },
 }
@@ -55,8 +47,45 @@ local STAGED_PALETTE = {
 	chg_priority = PRIORITY_STAGED_CHANGE,
 }
 
+local function theme_color(group, field)
+	local color = api.nvim_get_hl(0, { name = group })[field]
+	return color and string.format("#%06x", color)
+end
+
+-- Mix `fg` over `bg`; alpha 0 returns bg, alpha 1 returns fg.
+local function blend(fg, bg, alpha)
+	local function channel(hex, i)
+		return tonumber(hex:sub(i, i + 1), 16)
+	end
+	local r = math.floor(alpha * channel(fg, 2) + (1 - alpha) * channel(bg, 2) + 0.5)
+	local g = math.floor(alpha * channel(fg, 4) + (1 - alpha) * channel(bg, 4) + 0.5)
+	local b = math.floor(alpha * channel(fg, 6) + (1 - alpha) * channel(bg, 6) + 0.5)
+	return string.format("#%02x%02x%02x", r, g, b)
+end
+
+local function theme_colors()
+	local bg = theme_color("Normal", "bg") or (vim.o.background == "light" and "#ffffff" or "#000000")
+	local add = theme_color("Added", "fg") or "#4ade80"
+	local del = theme_color("Removed", "fg") or "#f87171"
+	local info = theme_color("DiagnosticInfo", "fg") or "#60a5fa"
+	local warn = theme_color("DiagnosticWarn", "fg") or "#facc15"
+
+	return {
+		-- Use the theme's own diff backgrounds when it defines them.
+		InlineDiffAddContext = theme_color("DiffAdd", "bg") or blend(add, bg, 0.30),
+		InlineDiffAddChange = theme_color("DiffText", "bg") or blend(add, bg, 0.55),
+		InlineDiffDeleteContext = theme_color("DiffDelete", "bg") or blend(del, bg, 0.30),
+		InlineDiffDeleteChange = blend(del, bg, 0.55),
+		-- Staged changes have no standard theme group, so tint info/warn accents.
+		InlineDiffStagedAddContext = blend(info, bg, 0.25),
+		InlineDiffStagedAddChange = blend(info, bg, 0.50),
+		InlineDiffStagedDeleteContext = blend(warn, bg, 0.25),
+		InlineDiffStagedDeleteChange = blend(warn, bg, 0.50),
+	}
+end
+
 local function setup_highlights()
-	local c = M.config.colors
+	local c = vim.tbl_extend("force", theme_colors(), M.config.colors or {})
 	for name, color in pairs(c) do
 		api.nvim_set_hl(0, name, { bg = color, default = false })
 	end
@@ -649,6 +678,10 @@ end
 M.setup = function(opts)
 	M.config = vim.tbl_deep_extend("force", M.default_config, opts or {})
 	setup_highlights()
+	api.nvim_create_autocmd("ColorScheme", {
+		group = api.nvim_create_augroup("InlineDiffColors", { clear = true }),
+		callback = setup_highlights,
+	})
 
 	if M.config.enabled and not M.enabled then
 		M.toggle()

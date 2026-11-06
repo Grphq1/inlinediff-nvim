@@ -50,24 +50,23 @@ opts = {
     show_staged = false,
 	ignored_buftype = { "terminal", "nofile" },
 	ignored_filetype = { "TelescopePrompt", "NvimTree", "neo-tree" },
+    -- Colors are derived from the active colorscheme and refreshed on ColorScheme.
+    -- Override any entry to pin a custom color, e.g.:
     colors = {
         -- context = dim background color; change = bright background color for changed text.
-        InlineDiffAddContext = "#182400",
-        InlineDiffAddChange = "#395200",
-        InlineDiffDeleteContext = "#240004",
-        InlineDiffDeleteChange = "#520005",
+        -- InlineDiffAddChange = "#395200",
+        -- InlineDiffDeleteChange = "#520005",
         -- Staged changes use their own colors so both can be visible together.
-        InlineDiffStagedAddContext = "#0b2233",
-        InlineDiffStagedAddChange = "#1f4f7a",
-        InlineDiffStagedDeleteContext = "#2b1d00",
-        InlineDiffStagedDeleteChange = "#6b4a00",
+        -- InlineDiffStagedAddContext = "#0b2233",
     },
 }
 ```
 
 Set `enabled = true` to start with the inline diff turned on, and `show_staged = true`
 to also display staged changes. When both staged and unstaged edits touch the same
-line, the unstaged highlight takes precedence.
+line, the unstaged highlight takes precedence. Diff colors follow the active
+colorscheme — unstaged edits reuse its `DiffAdd`/`DiffText`/`DiffDelete` backgrounds
+when defined, staged edits use its diagnostic info/warn accents.
 
 ## Commands
 
