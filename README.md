@@ -6,6 +6,7 @@ Simplest Neovim inline diff view with character-level highlighting.
 - Character-level highlighting across the entire buffer width
 - Auto-refresh with configurable debounce
 - Git-index comparison (works with unsaved buffers)
+- Optional staged changes shown at the same time, in their own colors
 - Configurable colors
 
 <img width="1440" height="900" alt="Screenshot 2026-01-28 at 16 54 19" src="https://github.com/user-attachments/assets/b4bd0b1f-d079-4951-b58b-35c681fa628f" />
@@ -43,6 +44,10 @@ return {
 ```lua
 opts = {
     debounce_time = 200,
+    -- Start with the inline diff enabled right after setup().
+    enabled = false,
+    -- Show staged changes alongside unstaged ones, in separate colors.
+    show_staged = false,
 	ignored_buftype = { "terminal", "nofile" },
 	ignored_filetype = { "TelescopePrompt", "NvimTree", "neo-tree" },
     colors = {
@@ -51,11 +56,21 @@ opts = {
         InlineDiffAddChange = "#395200",
         InlineDiffDeleteContext = "#240004",
         InlineDiffDeleteChange = "#520005",
+        -- Staged changes use their own colors so both can be visible together.
+        InlineDiffStagedAddContext = "#0b2233",
+        InlineDiffStagedAddChange = "#1f4f7a",
+        InlineDiffStagedDeleteContext = "#2b1d00",
+        InlineDiffStagedDeleteChange = "#6b4a00",
     },
 }
 ```
+
+Set `enabled = true` to start with the inline diff turned on, and `show_staged = true`
+to also display staged changes. When both staged and unstaged edits touch the same
+line, the unstaged highlight takes precedence.
 
 ## Commands
 
 - `:InlineDiff toggle`
 - `:InlineDiff refresh`
+- `:InlineDiff staged` — toggle showing staged changes alongside unstaged ones

@@ -8,11 +8,19 @@ M.last_diff_buf = nil -- Buffer id that `last_diff_output` corresponds to
 
 M.default_config = {
 	debounce_time = 200,
+	-- Start with the inline diff enabled right after setup().
+	enabled = false,
+	-- Show staged changes alongside unstaged ones, in separate colors.
+	show_staged = false,
 	colors = {
 		InlineDiffAddContext = "#182400",
 		InlineDiffAddChange = "#395200",
 		InlineDiffDeleteContext = "#240004",
 		InlineDiffDeleteChange = "#520005",
+		InlineDiffStagedAddContext = "#0b2233",
+		InlineDiffStagedAddChange = "#1f4f7a",
+		InlineDiffStagedDeleteContext = "#2b1d00",
+		InlineDiffStagedDeleteChange = "#6b4a00",
 	},
 	ignored_buftype = { "terminal", "nofile" },
 	ignored_filetype = { "TelescopePrompt", "NvimTree", "dap-repl", "neo-tree" },
@@ -22,10 +30,30 @@ M.config = vim.deepcopy(M.default_config)
 -- Constants for extmark priorities and rendering
 local PRIORITY_CONTEXT = 100
 local PRIORITY_CHANGE = 120
+-- Keep staged highlights below unstaged ones so the top-most change wins.
+local PRIORITY_STAGED_CONTEXT = 10
+local PRIORITY_STAGED_CHANGE = 30
 local MIN_PADDING_LENGTH = 40
 local MAX_PADDING_LENGTH = 300
 
 local DIFF_PREFIX = { UNCHANGED = " ", DELETED = "-", ADDED = "+" }
+
+local NORMAL_PALETTE = {
+	add_ctx = "InlineDiffAddContext",
+	add_chg = "InlineDiffAddChange",
+	del_ctx = "InlineDiffDeleteContext",
+	del_chg = "InlineDiffDeleteChange",
+	ctx_priority = PRIORITY_CONTEXT,
+	chg_priority = PRIORITY_CHANGE,
+}
+local STAGED_PALETTE = {
+	add_ctx = "InlineDiffStagedAddContext",
+	add_chg = "InlineDiffStagedAddChange",
+	del_ctx = "InlineDiffStagedDeleteContext",
+	del_chg = "InlineDiffStagedDeleteChange",
+	ctx_priority = PRIORITY_STAGED_CONTEXT,
+	chg_priority = PRIORITY_STAGED_CHANGE,
+}
 
 local function setup_highlights()
 	local c = M.config.colors
@@ -114,10 +142,8 @@ local function run_git_diff(bufnr, cb)
 		{ "git", "rev-parse", "--show-toplevel" },
 		{ cwd = vim.fn.fnamemodify(fullpath, ":h"), text = true },
 		function(root_obj)
-			local index_content = ""
-
 			if not root_obj or root_obj.code ~= 0 then
-				return cb(compute_unified_diff(index_content, buf_content))
+				return cb({ unstaged = compute_unified_diff("", buf_content), buffer_content = buf_content })
 			end
 
 			-- Compute repo-relative path
@@ -130,13 +156,96 @@ local function run_git_diff(bufnr, cb)
 				or vim.fn.fnamemodify(fullpath, ":t")
 
 			vim.system({ "git", "show", ":./" .. (relpath or "") }, { cwd = repo_root, text = true }, function(obj)
-				if obj and obj.code == 0 and obj.stdout then
-					index_content = obj.stdout
+				local index_content = (obj and obj.code == 0 and obj.stdout) or ""
+				local result = {
+					unstaged = compute_unified_diff(index_content, buf_content),
+					index_content = index_content,
+					buffer_content = buf_content,
+				}
+
+				if not M.config.show_staged then
+					return cb(result)
 				end
-				cb(compute_unified_diff(index_content, buf_content))
+
+				vim.system(
+					{ "git", "show", "HEAD:./" .. (relpath or "") },
+					{ cwd = repo_root, text = true },
+					function(head_obj)
+						local head_content = (head_obj and head_obj.code == 0 and head_obj.stdout) or ""
+						result.staged = compute_unified_diff(head_content, index_content)
+						cb(result)
+					end
+				)
 			end)
 		end
 	)
+end
+
+local function split_lines(content)
+	if content == "" then
+		return {}
+	end
+	local lines = vim.split(content, "\n", { plain = true })
+	if content:sub(-1) == "\n" then
+		table.remove(lines)
+	end
+	return lines
+end
+
+-- Map index lines onto buffer lines so staged hunks can be rendered in place.
+local function build_index_map(index_lines, buffer_lines)
+	local map, anchor = {}, {}
+	local diffs = vim.diff(table.concat(index_lines, "\n"), table.concat(buffer_lines, "\n"), {
+		algorithm = "minimal",
+		result_type = "indices",
+		ctxlen = 0,
+		interhunkctxlen = 0,
+	}) or {}
+
+	local i, j = 1, 1
+	for _, d in ipairs(diffs) do
+		local a_start, a_count, b_start, b_count = d[1], d[2], d[3], d[4]
+
+		-- Unchanged lines before this hunk. For pure insertions `a_start` is the
+		-- last unchanged index line before the insertion.
+		local before = a_count == 0 and a_start or (a_start - 1)
+		while i <= before do
+			map[i] = j
+			i, j = i + 1, j + 1
+		end
+
+		if a_count == 0 then
+			i, j = a_start + 1, b_start + b_count
+		else
+			local paired = math.min(a_count, b_count)
+			for k = 0, paired - 1 do
+				map[a_start + k] = b_start + k
+			end
+			-- Index lines deleted by unstaged changes point at the surviving line.
+			local del_anchor = b_count == 0 and (b_start + 1) or (b_start + b_count)
+			for k = paired, a_count - 1 do
+				anchor[a_start + k] = del_anchor
+			end
+			i, j = a_start + a_count, del_anchor
+		end
+	end
+
+	while i <= #index_lines do
+		map[i] = j
+		i, j = i + 1, j + 1
+	end
+
+	return map, anchor
+end
+
+local function index_to_buffer(map, anchor, i, index_count, buffer_count)
+	if i < 1 then
+		return 1
+	end
+	if i > index_count then
+		return buffer_count + 1
+	end
+	return map[i] or anchor[i] or (buffer_count + 1)
 end
 
 local function parse_hunks(output)
@@ -218,29 +327,29 @@ local function build_highlight_chunks(chars, mask, ctx_hl, chg_hl)
 	return chunks
 end
 
-local function apply_char_highlights(bufnr, virts_old, old_lines, new_lines, buf_line_idx, buf_lines_new)
+local function apply_char_highlights(bufnr, virts_old, old_lines, new_lines, rows, new_texts, pal)
 	for i = 1, math.min(#old_lines, #new_lines) do
-		local s_old, s_new = old_lines[i], buf_lines_new[i] or new_lines[i]
+		local s_old, s_new = old_lines[i], new_texts[i] or new_lines[i]
 		local c_old, c_new = build_char_array(s_old), build_char_array(s_new)
 		local diffs = compute_char_diff(c_old, c_new)
 
 		if diffs then
 			local old_mask, chgd_old = build_change_mask(diffs, 1)
 			if chgd_old < #c_old then
-				virts_old[i] =
-					build_highlight_chunks(c_old, old_mask, "InlineDiffDeleteContext", "InlineDiffDeleteChange")
+				virts_old[i] = build_highlight_chunks(c_old, old_mask, pal.del_ctx, pal.del_chg)
 			end
 
 			local new_mask, chgd_new = build_change_mask(diffs, 3)
-			if chgd_new < #c_new then
+			local row = rows[i]
+			if row and chgd_new < #c_new then
 				local map = byte_map_for(s_new)
 				for k = 1, #c_new do
 					if new_mask[k] then
 						local info = map[k]
-						api.nvim_buf_set_extmark(bufnr, M.ns, buf_line_idx + i - 1, info.byte, {
+						api.nvim_buf_set_extmark(bufnr, M.ns, row, info.byte, {
 							end_col = info.byte + info.char_len,
-							hl_group = "InlineDiffAddChange",
-							priority = PRIORITY_CHANGE,
+							hl_group = pal.add_chg,
+							priority = pal.chg_priority,
 						})
 					end
 				end
@@ -255,32 +364,37 @@ local function get_padding_text()
 	return string.rep(" ", padding_length)
 end
 
-local function flush_diff_group(bufnr, idx, old, new, padding)
+local function flush_diff_group(bufnr, idx, old, new, padding, pal)
 	if #old == 0 and #new == 0 then
 		return idx
 	end
 
 	local virts = {}
 	for i, line in ipairs(old) do
-		virts[i] = { { line, "InlineDiffDeleteContext" } }
+		virts[i] = { { line, pal.del_ctx } }
 	end
 
 	for j = 0, #new - 1 do
 		api.nvim_buf_set_extmark(bufnr, M.ns, idx + j, 0, {
 			end_line = idx + j + 1,
-			hl_group = "InlineDiffAddContext",
+			hl_group = pal.add_ctx,
 			hl_eol = true,
-			priority = PRIORITY_CONTEXT,
+			priority = pal.ctx_priority,
 		})
 	end
 
 	local buf_lines = #new > 0 and api.nvim_buf_get_lines(bufnr, idx, idx + #new, false) or {}
-	apply_char_highlights(bufnr, virts, old, new, idx, buf_lines)
+	local rows, new_texts = {}, {}
+	for i = 1, #new do
+		rows[i] = idx + i - 1
+		new_texts[i] = buf_lines[i] or new[i]
+	end
+	apply_char_highlights(bufnr, virts, old, new, rows, new_texts, pal)
 
 	if #virts > 0 then
 		local final = {}
 		for _, chunks in ipairs(virts) do
-			table.insert(chunks, { padding, "InlineDiffDeleteContext" })
+			table.insert(chunks, { padding, pal.del_ctx })
 			table.insert(final, chunks)
 		end
 		api.nvim_buf_set_extmark(bufnr, M.ns, idx, 0, {
@@ -292,14 +406,13 @@ local function flush_diff_group(bufnr, idx, old, new, padding)
 	return idx + #new
 end
 
-local function render_hunk(bufnr, hunk)
+local function render_hunk(bufnr, hunk, padding, pal)
 	local idx, old, new = hunk.new_start - 1, {}, {}
-	local padding = get_padding_text()
 
 	for _, l in ipairs(hunk.lines) do
 		local prefix, content = l:sub(1, 1), l:sub(2)
 		if prefix == DIFF_PREFIX.UNCHANGED then
-			idx = flush_diff_group(bufnr, idx, old, new, padding) + 1
+			idx = flush_diff_group(bufnr, idx, old, new, padding, pal) + 1
 			old, new = {}, {}
 		elseif prefix == DIFF_PREFIX.DELETED then
 			table.insert(old, content)
@@ -307,7 +420,82 @@ local function render_hunk(bufnr, hunk)
 			table.insert(new, content)
 		end
 	end
-	flush_diff_group(bufnr, idx, old, new, padding)
+	flush_diff_group(bufnr, idx, old, new, padding, pal)
+end
+
+-- Render a HEAD->index hunk in buffer coordinates using the index->buffer map.
+local function render_staged_hunk(bufnr, hunk, map, anchor, index_count, buffer_count, padding)
+	local ipos, group_ipos = hunk.new_start, hunk.new_start
+	local old, new = {}, {}
+
+	local function flush()
+		if #old == 0 and #new == 0 then
+			return
+		end
+
+		local start_line = index_to_buffer(map, anchor, group_ipos, index_count, buffer_count)
+		local virts = {}
+		for i, line in ipairs(old) do
+			virts[i] = { { line, STAGED_PALETTE.del_ctx } }
+		end
+
+		local rows, new_texts = {}, {}
+		for k = 1, #new do
+			local bl = map[group_ipos + k - 1]
+			if bl then
+				rows[k] = bl - 1
+				new_texts[k] = api.nvim_buf_get_lines(bufnr, bl - 1, bl, false)[1] or new[k]
+			else
+				new_texts[k] = new[k]
+			end
+		end
+
+		for k, row in pairs(rows) do
+			api.nvim_buf_set_extmark(bufnr, M.ns, row, 0, {
+				end_line = row + 1,
+				hl_group = STAGED_PALETTE.add_ctx,
+				hl_eol = true,
+				priority = STAGED_PALETTE.ctx_priority,
+			})
+		end
+
+		apply_char_highlights(bufnr, virts, old, new, rows, new_texts, STAGED_PALETTE)
+
+		if #virts > 0 then
+			local final = {}
+			for _, chunks in ipairs(virts) do
+				table.insert(chunks, { padding, STAGED_PALETTE.del_ctx })
+				table.insert(final, chunks)
+			end
+			api.nvim_buf_set_extmark(bufnr, M.ns, start_line - 1, 0, {
+				virt_lines = final,
+				virt_lines_above = true,
+			})
+		end
+
+		old, new = {}, {}
+	end
+
+	for _, l in ipairs(hunk.lines) do
+		local prefix, content = l:sub(1, 1), l:sub(2)
+		if prefix == DIFF_PREFIX.UNCHANGED then
+			flush()
+			ipos = ipos + 1
+			group_ipos = ipos
+		elseif prefix == DIFF_PREFIX.DELETED then
+			if #old == 0 and #new == 0 then
+				group_ipos = ipos
+			end
+			table.insert(old, content)
+		elseif prefix == DIFF_PREFIX.ADDED then
+			if #old == 0 and #new == 0 then
+				group_ipos = ipos
+			end
+			table.insert(new, content)
+			ipos = ipos + 1
+		end
+	end
+	flush()
 end
 
 M.refresh = function(bufnr)
@@ -318,17 +506,28 @@ M.refresh = function(bufnr)
 
 	run_git_diff(
 		bufnr,
-		vim.schedule_wrap(function(output)
-			if M.last_diff_buf == bufnr and output == M.last_diff_output then
+		vim.schedule_wrap(function(result)
+			local key = (result.staged or "") .. "\0" .. (result.unstaged or "")
+			if M.last_diff_buf == bufnr and key == M.last_diff_output then
 				return
 			end
 
-			M.last_diff_output, M.last_diff_buf = output, bufnr
+			M.last_diff_output, M.last_diff_buf = key, bufnr
 			api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+			local padding = get_padding_text()
 
-			if output then
-				for _, h in ipairs(parse_hunks(output)) do
-					render_hunk(bufnr, h)
+			if result.staged then
+				local index_lines = split_lines(result.index_content or "")
+				local buffer_lines = split_lines(result.buffer_content or "")
+				local map, anchor = build_index_map(index_lines, buffer_lines)
+				for _, h in ipairs(parse_hunks(result.staged)) do
+					render_staged_hunk(bufnr, h, map, anchor, #index_lines, #buffer_lines, padding)
+				end
+			end
+
+			if result.unstaged then
+				for _, h in ipairs(parse_hunks(result.unstaged)) do
+					render_hunk(bufnr, h, padding, NORMAL_PALETTE)
 				end
 			end
 		end)
@@ -399,6 +598,15 @@ local function setup_autocmds()
 		end,
 	})
 
+	api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+		group = augroup,
+		callback = function()
+			if M.enabled then
+				M.refresh()
+			end
+		end,
+	})
+
 	api.nvim_create_autocmd({ "BufUnload", "BufDelete" }, {
 		group = augroup,
 		callback = function(ctx)
@@ -431,9 +639,20 @@ function M.toggle()
 	end
 end
 
+function M.toggle_staged()
+	M.config.show_staged = not M.config.show_staged
+	clear_cache()
+	M.refresh()
+	print("InlineDiff: staged changes " .. (M.config.show_staged and "shown" or "hidden"))
+end
+
 M.setup = function(opts)
 	M.config = vim.tbl_deep_extend("force", M.default_config, opts or {})
 	setup_highlights()
+
+	if M.config.enabled and not M.enabled then
+		M.toggle()
+	end
 
 	if not api.nvim_get_commands({})["InlineDiff"] then
 		pcall(api.nvim_create_user_command, "InlineDiff", function(cmd)
@@ -442,21 +661,23 @@ M.setup = function(opts)
 				M.toggle()
 			elseif arg == "refresh" then
 				M.refresh()
+			elseif arg == "staged" then
+				M.toggle_staged()
 			else
-				print('InlineDiff: unknown arg "' .. arg .. '". Use "toggle" or "refresh"')
+				print('InlineDiff: unknown arg "' .. arg .. '". Use "toggle", "refresh" or "staged"')
 			end
 		end, {
 			nargs = "?",
 			complete = function(lead)
 				local res = {}
-				for _, v in ipairs({ "toggle", "refresh" }) do
+				for _, v in ipairs({ "toggle", "refresh", "staged" }) do
 					if v:sub(1, #lead) == lead then
 						table.insert(res, v)
 					end
 				end
 				return res
 			end,
-			desc = "InlineDiff commands: toggle or refresh",
+			desc = "InlineDiff commands: toggle, refresh or staged",
 		})
 	end
 end
