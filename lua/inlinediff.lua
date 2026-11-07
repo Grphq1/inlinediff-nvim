@@ -2,35 +2,25 @@ local M = {}
 local api = vim.api
 
 M.ns = api.nvim_create_namespace("inlinediff")
+M.cursor_ns = api.nvim_create_namespace("inlinediff_cursor")
 M.enabled = false
-M.last_diff_output = nil -- Cache to prevent unnecessary redraws
-M.last_diff_buf = nil -- Buffer id that `last_diff_output` corresponds to
+M.last_diff_output = nil
+M.last_diff_buf = nil
 
 M.default_config = {
 	debounce_time = 200,
-	-- Start with the inline diff enabled right after setup().
 	enabled = false,
-	-- Show staged changes alongside unstaged ones, in separate colors.
 	show_staged = false,
-	colors = {
-		InlineDiffAddContext = "#182400",
-		InlineDiffAddChange = "#395200",
-		InlineDiffDeleteContext = "#240004",
-		InlineDiffDeleteChange = "#520005",
-		InlineDiffStagedAddContext = "#0b2233",
-		InlineDiffStagedAddChange = "#1f4f7a",
-		InlineDiffStagedDeleteContext = "#2b1d00",
-		InlineDiffStagedDeleteChange = "#6b4a00",
-	},
+	cursor_highlight = true,
+	colors = {},
 	ignored_buftype = { "terminal", "nofile" },
 	ignored_filetype = { "TelescopePrompt", "NvimTree", "dap-repl", "neo-tree" },
 }
 M.config = vim.deepcopy(M.default_config)
 
--- Constants for extmark priorities and rendering
+-- Extmark priorities
 local PRIORITY_CONTEXT = 100
 local PRIORITY_CHANGE = 120
--- Keep staged highlights below unstaged ones so the top-most change wins.
 local PRIORITY_STAGED_CONTEXT = 10
 local PRIORITY_STAGED_CHANGE = 30
 local MIN_PADDING_LENGTH = 40
@@ -55,12 +45,154 @@ local STAGED_PALETTE = {
 	chg_priority = PRIORITY_STAGED_CHANGE,
 }
 
+-- Every base highlight group has a cursor-variant: "<group>Cursor".
+local function cursor_hl(hl)
+	return hl and (hl .. "Cursor")
+end
+
+-- Tracks the virt_lines extmark we temporarily re-tinted for the cursor.
+local cursor_virt_state = {}
+
+local function theme_color(group, field)
+	-- link=false resolves colorscheme links (e.g. Added = { link = "String" }).
+	local color = api.nvim_get_hl(0, { name = group, link = false })[field]
+	return color and string.format("#%06x", color)
+end
+
+-- Mix `fg` over `bg`; alpha 0 returns bg, alpha 1 returns fg.
+local function blend(fg, bg, alpha)
+	local function channel(hex, i)
+		return tonumber(hex:sub(i, i + 1), 16)
+	end
+	local r = math.floor(alpha * channel(fg, 2) + (1 - alpha) * channel(bg, 2) + 0.5)
+	local g = math.floor(alpha * channel(fg, 4) + (1 - alpha) * channel(bg, 4) + 0.5)
+	local b = math.floor(alpha * channel(fg, 6) + (1 - alpha) * channel(bg, 6) + 0.5)
+	return string.format("#%02x%02x%02x", r, g, b)
+end
+
+local function theme_colors()
+	local bg = theme_color("Normal", "bg") or (vim.o.background == "light" and "#ffffff" or "#000000")
+	local add = theme_color("Added", "fg") or "#4ade80"
+	local del = theme_color("Removed", "fg") or "#f87171"
+	local info = theme_color("DiagnosticInfo", "fg") or "#60a5fa"
+	local warn = theme_color("DiagnosticWarn", "fg") or "#facc15"
+
+	return {
+		InlineDiffAddContext = blend(add, bg, 0.18),
+		InlineDiffAddChange = blend(add, bg, 0.30),
+		InlineDiffDeleteContext = blend(del, bg, 0.18),
+		InlineDiffDeleteChange = blend(del, bg, 0.30),
+		InlineDiffStagedAddContext = blend(info, bg, 0.14),
+		InlineDiffStagedAddChange = blend(info, bg, 0.26),
+		InlineDiffStagedDeleteContext = blend(warn, bg, 0.14),
+		InlineDiffStagedDeleteChange = blend(warn, bg, 0.26),
+
+		-- Cursor-variant colors: one step above the base tint, kept dark enough to read text.
+		InlineDiffAddContextCursor = blend(add, bg, 0.28),
+		InlineDiffAddChangeCursor = blend(add, bg, 0.42),
+		InlineDiffDeleteContextCursor = blend(del, bg, 0.28),
+		InlineDiffDeleteChangeCursor = blend(del, bg, 0.42),
+		InlineDiffStagedAddContextCursor = blend(info, bg, 0.22),
+		InlineDiffStagedAddChangeCursor = blend(info, bg, 0.36),
+		InlineDiffStagedDeleteContextCursor = blend(warn, bg, 0.22),
+		InlineDiffStagedDeleteChangeCursor = blend(warn, bg, 0.36),
+	}
+end
+
 local function setup_highlights()
-	local c = M.config.colors
+	local c = vim.tbl_extend("force", theme_colors(), M.config.colors or {})
 	for name, color in pairs(c) do
 		api.nvim_set_hl(0, name, { bg = color, default = false })
 	end
 end
+
+local function update_cursor_highlight()
+	-- 1) Restore any virt_lines we re-tinted previously (may be a different buffer).
+	if cursor_virt_state.bufnr and cursor_virt_state.id then
+		local b = cursor_virt_state.bufnr
+		if api.nvim_buf_is_valid(b) then
+			pcall(api.nvim_buf_set_extmark, b, M.ns, cursor_virt_state.row, 0, {
+				id = cursor_virt_state.id,
+				virt_lines = cursor_virt_state.original,
+				virt_lines_above = true,
+			})
+		end
+		cursor_virt_state = {}
+	end
+
+	local bufnr = api.nvim_get_current_buf()
+	if not api.nvim_buf_is_valid(bufnr) then
+		return
+	end
+
+	-- 2) Drop any previous overlay.
+	api.nvim_buf_clear_namespace(bufnr, M.cursor_ns, 0, -1)
+
+	if not M.enabled or not M.config.cursor_highlight then
+		return
+	end
+
+	local row = api.nvim_win_get_cursor(0)[1] - 1
+	local marks = api.nvim_buf_get_extmarks(bufnr, M.ns, { row, 0 }, { row + 1, 0 }, { details = true })
+
+	for _, mark in ipairs(marks) do
+		-- nvim_buf_get_extmarks returns { id, row, col, details }, not a { row, col } pos.
+		local id, mark_row, mark_col, details = mark[1], mark[2], mark[3], mark[4]
+		if mark_row == row then
+			if details.virt_lines then
+				-- Re-tint deleted lines that sit above this row.
+				local new_virts, changed = {}, false
+				for i, chunks in ipairs(details.virt_lines) do
+					local new_chunks = {}
+					for j, chunk in ipairs(chunks) do
+						local text, chl = chunk[1], chunk[2]
+						local mapped = cursor_hl(chl)
+						if mapped then
+							changed = true
+						end
+						new_chunks[j] = { text, mapped or chl }
+					end
+					new_virts[i] = new_chunks
+				end
+				if changed then
+					cursor_virt_state = {
+						bufnr = bufnr,
+						row = mark_row,
+						id = id,
+						original = details.virt_lines,
+					}
+					api.nvim_buf_set_extmark(bufnr, M.ns, mark_row, 0, {
+						id = id,
+						virt_lines = new_virts,
+						virt_lines_above = true,
+					})
+				end
+			else
+				local hl = details.hl_group
+				local mapped = cursor_hl(hl)
+				if mapped then
+					if details.end_row and details.end_row > mark_row then
+						-- Whole-line background (add_ctx / del_ctx)
+						api.nvim_buf_set_extmark(bufnr, M.cursor_ns, row, 0, {
+							end_line = details.end_row,
+							hl_group = mapped,
+							hl_eol = true,
+							priority = (details.priority or 100) + 5,
+						})
+					elseif details.end_col then
+						-- Character-range (add_chg / del_chg)
+						api.nvim_buf_set_extmark(bufnr, M.cursor_ns, row, mark_col, {
+							end_col = details.end_col,
+							hl_group = mapped,
+							priority = (details.priority or 120) + 5,
+						})
+					end
+				end
+			end
+		end
+	end
+end
+
 local function build_char_array(s)
 	local chars = {}
 	local n = vim.str_utfindex(s, "utf-8") or 0
@@ -81,13 +213,13 @@ local function byte_map_for(s)
 	return map
 end
 
-local function is_in_list(value, list)
+local function is_ignored(value, list)
 	for _, v in ipairs(list or {}) do
 		if value == v then
-			return false
+			return true
 		end
 	end
-	return true
+	return false
 end
 
 local function is_buffer_valid(bufnr)
@@ -96,12 +228,12 @@ local function is_buffer_valid(bufnr)
 	end
 
 	local ok, buftype = pcall(api.nvim_buf_get_option, bufnr, "buftype")
-	if ok and buftype ~= "" and not is_in_list(buftype, M.config.ignored_buftype) then
+	if ok and buftype ~= "" and is_ignored(buftype, M.config.ignored_buftype) then
 		return false
 	end
 
 	local ok2, ft = pcall(api.nvim_buf_get_option, bufnr, "filetype")
-	if ok2 and ft ~= "" and not is_in_list(ft, M.config.ignored_filetype) then
+	if ok2 and ft ~= "" and is_ignored(ft, M.config.ignored_filetype) then
 		return false
 	end
 
@@ -129,6 +261,30 @@ local function compute_unified_diff(old_content, new_content)
 	return (diff_out and diff_out ~= "") and diff_out or nil
 end
 
+-- Tracks .git/index mtime so staging outside the buffer (git add, gitsigns, ...)
+-- triggers a refresh on the next cursor move/focus.
+local index_path, index_mtime = nil, nil
+
+local function read_index_mtime()
+	if not index_path then
+		return nil
+	end
+	local stat = vim.loop.fs_stat(index_path)
+	return stat and (stat.mtime.sec * 1e9 + stat.mtime.nsec) or 0
+end
+
+local function git_index_changed()
+	if not index_path then
+		return false
+	end
+	local mtime = read_index_mtime()
+	if mtime ~= index_mtime then
+		index_mtime = mtime
+		return true
+	end
+	return false
+end
+
 local function run_git_diff(bufnr, cb)
 	local path = api.nvim_buf_get_name(bufnr)
 	if path == "" then
@@ -139,15 +295,18 @@ local function run_git_diff(bufnr, cb)
 	local buf_content = table.concat(api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n"
 
 	vim.system(
-		{ "git", "rev-parse", "--show-toplevel" },
+		{ "git", "rev-parse", "--show-toplevel", "--absolute-git-dir" },
 		{ cwd = vim.fn.fnamemodify(fullpath, ":h"), text = true },
 		function(root_obj)
 			if not root_obj or root_obj.code ~= 0 then
+				index_path, index_mtime = nil, nil
 				return cb({ unstaged = compute_unified_diff("", buf_content), buffer_content = buf_content })
 			end
 
-			-- Compute repo-relative path
-			local repo_root = root_obj.stdout:gsub("\n$", "")
+			local rev = vim.split(root_obj.stdout, "\n", { trimempty = true })
+			local repo_root, git_dir = rev[1], rev[2]
+			index_path, index_mtime = git_dir and (git_dir .. "/index") or nil, nil
+			index_mtime = read_index_mtime()
 			local real_fullpath = vim.loop.fs_realpath(fullpath) or fullpath
 			local real_repo_root = vim.loop.fs_realpath(repo_root) or repo_root
 
@@ -192,7 +351,6 @@ local function split_lines(content)
 	return lines
 end
 
--- Map index lines onto buffer lines so staged hunks can be rendered in place.
 local function build_index_map(index_lines, buffer_lines)
 	local map, anchor = {}, {}
 	local diffs = vim.diff(table.concat(index_lines, "\n"), table.concat(buffer_lines, "\n"), {
@@ -206,8 +364,6 @@ local function build_index_map(index_lines, buffer_lines)
 	for _, d in ipairs(diffs) do
 		local a_start, a_count, b_start, b_count = d[1], d[2], d[3], d[4]
 
-		-- Unchanged lines before this hunk. For pure insertions `a_start` is the
-		-- last unchanged index line before the insertion.
 		local before = a_count == 0 and a_start or (a_start - 1)
 		while i <= before do
 			map[i] = j
@@ -221,7 +377,6 @@ local function build_index_map(index_lines, buffer_lines)
 			for k = 0, paired - 1 do
 				map[a_start + k] = b_start + k
 			end
-			-- Index lines deleted by unstaged changes point at the surviving line.
 			local del_anchor = b_count == 0 and (b_start + 1) or (b_start + b_count)
 			for k = paired, a_count - 1 do
 				anchor[a_start + k] = del_anchor
@@ -256,7 +411,7 @@ local function parse_hunks(output)
 	while i <= #lines do
 		local line = lines[i]
 		if line:match("^@@") then
-			local ns, nc = line:match("@@ .* %+(%d+),?(%d*) @@")
+			local ns = line:match("@@ .* %+(%d+),?%d* @@")
 			if ns then
 				local hunk = { new_start = tonumber(ns), lines = {} }
 				i = i + 1
@@ -423,7 +578,6 @@ local function render_hunk(bufnr, hunk, padding, pal)
 	flush_diff_group(bufnr, idx, old, new, padding, pal)
 end
 
--- Render a HEAD->index hunk in buffer coordinates using the index->buffer map.
 local function render_staged_hunk(bufnr, hunk, map, anchor, index_count, buffer_count, padding)
 	local ipos, group_ipos = hunk.new_start, hunk.new_start
 	local old, new = {}, {}
@@ -507,6 +661,10 @@ M.refresh = function(bufnr)
 	run_git_diff(
 		bufnr,
 		vim.schedule_wrap(function(result)
+			if not api.nvim_buf_is_valid(bufnr) then
+				return
+			end
+
 			local key = (result.staged or "") .. "\0" .. (result.unstaged or "")
 			if M.last_diff_buf == bufnr and key == M.last_diff_output then
 				return
@@ -514,6 +672,10 @@ M.refresh = function(bufnr)
 
 			M.last_diff_output, M.last_diff_buf = key, bufnr
 			api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
+			-- Re-rendering drops the extmark; don't let the cursor overlay restore a stale one.
+			if cursor_virt_state.bufnr == bufnr then
+				cursor_virt_state = {}
+			end
 			local padding = get_padding_text()
 
 			if result.staged then
@@ -530,6 +692,10 @@ M.refresh = function(bufnr)
 					render_hunk(bufnr, h, padding, NORMAL_PALETTE)
 				end
 			end
+
+			-- All base highlights are in place; now repaint the cursor overlay.
+			api.nvim_buf_clear_namespace(bufnr, M.cursor_ns, 0, -1)
+			update_cursor_highlight()
 		end)
 	)
 end
@@ -578,6 +744,20 @@ local function setup_autocmds()
 	end
 	augroup = api.nvim_create_augroup("InlineDiffAuto", { clear = true })
 
+	api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinEnter", "FocusGained" }, {
+		group = augroup,
+		callback = function()
+			if not M.enabled then
+				return
+			end
+			-- Staging happens in the index, not the buffer, so it fires no TextChanged.
+			if git_index_changed() then
+				M.refresh()
+			end
+			update_cursor_highlight()
+		end,
+	})
+
 	api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
 		group = augroup,
 		callback = function()
@@ -610,7 +790,11 @@ local function setup_autocmds()
 	api.nvim_create_autocmd({ "BufUnload", "BufDelete" }, {
 		group = augroup,
 		callback = function(ctx)
-			clear_cache(ctx.buf or ctx.bufnr)
+			local b = ctx.buf or ctx.bufnr
+			clear_cache(b)
+			if cursor_virt_state.bufnr == b then
+				cursor_virt_state = {}
+			end
 		end,
 	})
 end
@@ -631,9 +815,11 @@ function M.toggle()
 			augroup = nil
 		end
 		stop_timer()
+		cursor_virt_state = {}
 		for _, b in ipairs(api.nvim_list_bufs()) do
 			if api.nvim_buf_is_loaded(b) then
 				pcall(api.nvim_buf_clear_namespace, b, M.ns, 0, -1)
+				pcall(api.nvim_buf_clear_namespace, b, M.cursor_ns, 0, -1)
 			end
 		end
 	end
@@ -649,6 +835,10 @@ end
 M.setup = function(opts)
 	M.config = vim.tbl_deep_extend("force", M.default_config, opts or {})
 	setup_highlights()
+	api.nvim_create_autocmd("ColorScheme", {
+		group = api.nvim_create_augroup("InlineDiffColors", { clear = true }),
+		callback = setup_highlights,
+	})
 
 	if M.config.enabled and not M.enabled then
 		M.toggle()
