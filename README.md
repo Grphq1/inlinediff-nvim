@@ -7,6 +7,7 @@ Simplest Neovim inline diff view with character-level highlighting.
 - Auto-refresh with configurable debounce
 - Git-index comparison (works with unsaved buffers)
 - Optional staged changes shown at the same time, in their own colors
+- Optional brighter highlight for the diff under the cursor
 - Configurable colors
 
 <img width="1440" height="900" alt="Screenshot 2026-01-28 at 16 54 19" src="https://github.com/user-attachments/assets/b4bd0b1f-d079-4951-b58b-35c681fa628f" />
@@ -48,26 +49,27 @@ opts = {
     enabled = false,
     -- Show staged changes alongside unstaged ones, in separate colors.
     show_staged = false,
+    -- Tint the diff on the line under the cursor more strongly.
+    cursor_highlight = true,
 	ignored_buftype = { "terminal", "nofile" },
-	ignored_filetype = { "TelescopePrompt", "NvimTree", "neo-tree" },
+	ignored_filetype = { "TelescopePrompt", "NvimTree", "dap-repl", "neo-tree" },
+    -- Colors are derived from the active colorscheme and refreshed on ColorScheme.
+    -- Override any entry to pin a custom color, e.g.:
     colors = {
         -- context = dim background color; change = bright background color for changed text.
-        InlineDiffAddContext = "#182400",
-        InlineDiffAddChange = "#395200",
-        InlineDiffDeleteContext = "#240004",
-        InlineDiffDeleteChange = "#520005",
+        -- InlineDiffAddChange = "#395200",
+        -- InlineDiffDeleteChange = "#520005",
         -- Staged changes use their own colors so both can be visible together.
-        InlineDiffStagedAddContext = "#0b2233",
-        InlineDiffStagedAddChange = "#1f4f7a",
-        InlineDiffStagedDeleteContext = "#2b1d00",
-        InlineDiffStagedDeleteChange = "#6b4a00",
+        -- InlineDiffStagedAddContext = "#0b2233",
     },
 }
 ```
 
 Set `enabled = true` to start with the inline diff turned on, and `show_staged = true`
 to also display staged changes. When both staged and unstaged edits touch the same
-line, the unstaged highlight takes precedence.
+line, the unstaged highlight takes precedence. Diff colors follow the active
+colorscheme — unstaged edits are low-intensity tints of its `Added`/`Removed`
+accents, staged edits of its diagnostic info/warn accents, so text stays readable.
 
 ## Commands
 
